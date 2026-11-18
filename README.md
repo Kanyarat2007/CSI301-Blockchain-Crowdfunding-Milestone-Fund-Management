@@ -32,13 +32,22 @@ npm run dev
 
 ## 3. ขั้นตอนทดสอบครบวงจร
 
-1. Wallet A เชื่อมต่อและสร้างโครงการ เป้าหมาย `0.02 ETH` ระยะเวลา 1 วัน Milestone 1=`0.01 ETH`, Milestone 2=`0.01 ETH`
-2. Wallet B ส่ง `0.02 ETH` เข้า Campaign (บวก gas แยกต่างหาก)
-3. รอ deadline (หรือใช้ Remix VM และสร้าง Campaign ด้วย durationSeconds สั้นเพื่อทดสอบเร็ว)
-4. Wallet A ส่งหลักฐาน Milestone 1 เช่น URL GitHub/Google Drive ที่เปิดอ่านได้
-5. Wallet B โหวตเห็นชอบ
-6. หลัง 3 วัน เรียก `release()` (ใครก็เรียกได้) และตรวจเงินเข้ากระเป๋า Creator
-7. ดำเนินการ Milestone 2 ตามลำดับ
-8. ทดสอบ Refund ด้วยอีก Campaign ที่ยอดไม่ถึงเป้าหมายเมื่อหมดเวลา
+1. Wallet A เชื่อมต่อและสร้างโครงการ เป้าหมาย `0.001 ETH` ระยะเวลา 1 วัน Milestone 1=`0.001 ETH`
+![1](/images/1.png)
 
-> Remix UI `VALUE` สำหรับธุรกรรม payable ต้องเลือกหน่วย `Ether` แล้วกรอกตัวเลขที่ช่อง Value **ก่อน** กดปุ่ม `contribute`; ฟังก์ชัน `contribute` รับ Campaign ID ส่วน ETH มาจาก `msg.value` ไม่ใช่อาร์กิวเมนต์ฟังก์ชัน
+2. Wallet B ส่ง `0.02 ETH` เข้า Campaign
+![2](/images/2.png)
+
+3. รอ deadline
+
+4. Wallet A ส่งหลักฐาน Milestone 1 เช่น URL GitHub/Google Drive ที่เปิดอ่านได้
+![4](/images/4.png)
+
+5. Wallet B โหวตเห็นชอบ
+![5](/images/5.png)
+
+6. หลัง 3 วัน เรียก `release()` (ใครก็เรียกได้) และตรวจเงินเข้ากระเป๋า Creator
+![6]
+
+7. ทดสอบ Refund ด้วยอีก Campaign ที่ยอดไม่ถึงเป้าหมายเมื่อหมดเวลา
+![7]

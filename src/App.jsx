@@ -39,6 +39,12 @@ const initial = {
   days: "7",
   milestones: [{ title: "", amount: "" }],
 };
+
+function toLocalDateTimeInput(date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+
+  return local.toISOString().slice(0, 16);
+}
 function App() {
   const [account, setAccount] = useState("");
   const [admin, setAdmin] = useState("");
@@ -53,7 +59,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState(null);
   const [events, setEvents] = useState([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState("");
+  const [eventsRange, setEventsRange] = useState("");
   const [mobile, setMobile] = useState(false);
+  const [endDateTime, setEndDateTime] = useState("");
   const isAdmin = same(account, admin);
   const owned = useMemo(
     () => campaigns.filter((c) => same(c.creator, account)),
@@ -167,15 +177,18 @@ function App() {
       const contract = await writeContract();
       const tx = await fn(contract);
       setMessage({ text: `ส่งธุรกรรมแล้ว ${short(tx.hash)} — กำลังยืนยัน...` });
-      await tx.wait();
+      const receipt = await tx.wait();
+      if (receipt?.status !== 1) throw Error("ธุรกรรมไม่สำเร็จ");
       setMessage({ text: "ธุรกรรมสำเร็จบน Blockchain" });
       await load();
       if (selected) await openCampaign(selected.id);
+      return true;
     } catch (e) {
       setMessage({
         error: true,
         text: e.reason || e.shortMessage || e.message,
       });
+      return false;
     } finally {
       setBusy(false);
     }
@@ -208,78 +221,162 @@ function App() {
       });
       setTab("detail");
       setEvents([]);
+      setEventsError("");
+      setEventsLoading(true);
       try {
-        const filter = ethers.id(
-          "CampaignCreated(uint256,address,string,uint256)",
+        const latestBlock = await readProvider.getBlockNumber();
+        // Set VITE_CONTRACT_DEPLOY_BLOCK to the block where this contract was deployed
+        // to retrieve its entire event history. Without it, scan the latest 45,000 blocks.
+        const configuredStart = import.meta.env.VITE_CONTRACT_DEPLOY_BLOCK;
+        const startBlock =
+          configuredStart && /^\d+$/.test(configuredStart)
+            ? Number(configuredStart)
+            : Math.max(0, latestBlock - 45000);
+        if (startBlock > latestBlock)
+          throw Error("Deployment block is in the future");
+        setEventsRange(
+          configuredStart
+            ? `ตั้งแต่บล็อกที่ Deploy (${startBlock.toLocaleString()}) ถึง ${latestBlock.toLocaleString()}`
+            : `ย้อนหลัง 45,000 บล็อกล่าสุด (${startBlock.toLocaleString()}–${latestBlock.toLocaleString()}) — กำหนด VITE_CONTRACT_DEPLOY_BLOCK เพื่อดูประวัติทั้งหมด`,
         );
-        void filter;
-        const logs = await readProvider.getLogs({
-          address: ADDRESS,
-          fromBlock: Math.max(0, (await readProvider.getBlockNumber()) - 45000),
-          toBlock: "latest",
-        });
         const iface = new ethers.Interface(ABI);
-        const parsed = logs
-          .map((l) => {
-            try {
-              return { event: iface.parseLog(l), hash: l.transactionHash };
-            } catch {
-              return null;
-            }
-          })
-          .filter(
-            (x) =>
-              x?.event &&
-              [
-                "Contributed",
-                "ReleaseRequested",
-                "Voted",
-                "FundsReleased",
-                "Refunded",
-              ].includes(x.event.name) &&
-              Number(x.event.args[0]) === id,
-          );
-        setEvents(parsed.reverse().slice(0, 25));
-      } catch {
-        setEvents([]);
+        const names = [
+          "Contributed",
+          "ReleaseRequested",
+          "Voted",
+          "FundsReleased",
+          "Refunded",
+        ];
+        const topics = names.map((name) => iface.getEvent(name).topicHash);
+        const campaignTopic = ethers.zeroPadValue(ethers.toBeHex(id), 32);
+        const found = [];
+        // Query in small chunks to avoid eth_getLogs range limits.
+        for (
+          let fromBlock = startBlock;
+          fromBlock <= latestBlock;
+          fromBlock += 2000
+        ) {
+          const toBlock = Math.min(latestBlock, fromBlock + 1999);
+          const logs = await readProvider.getLogs({
+            address: ADDRESS,
+            topics: [topics, campaignTopic],
+            fromBlock,
+            toBlock,
+          });
+          for (const log of logs) {
+            const event = iface.parseLog(log);
+            if (event)
+              found.push({
+                event,
+                hash: log.transactionHash,
+                blockNumber: log.blockNumber,
+                logIndex: log.index,
+              });
+          }
+        }
+        found.sort(
+          (a, b) => b.blockNumber - a.blockNumber || b.logIndex - a.logIndex,
+        );
+        const latest = found.slice(0, 25);
+        const blocks = [...new Set(latest.map((e) => e.blockNumber))];
+        const timestamps = new Map(
+          await Promise.all(
+            blocks.map(async (number) => {
+              const block = await readProvider.getBlock(number);
+              return [number, block?.timestamp ?? null];
+            }),
+          ),
+        );
+        setEvents(
+          latest.map((e) => ({
+            ...e,
+            timestamp: timestamps.get(e.blockNumber),
+          })),
+        );
+      } catch (err) {
+        setEventsError(
+          err.shortMessage || err.message || "ไม่สามารถอ่าน Event ได้",
+        );
+      } finally {
+        setEventsLoading(false);
       }
     } catch (e) {
       setMessage({ error: true, text: e.message });
     }
   };
-  const create = () => {
+
+  const create = (durationSeconds) => {
     const goal = ethers.parseEther(form.goal);
+
     const amounts = form.milestones.map((m) => ethers.parseEther(m.amount));
-    if (amounts.reduce((a, b) => a + b, 0n) > goal)
+
+    if (amounts.reduce((a, b) => a + b, 0n) > goal) {
       throw Error("ยอดรวม Milestone ต้องไม่เกินเป้าหมาย");
+    }
+
+    console.log("ระยะเวลาที่ส่งเข้า Contract:", durationSeconds);
+    console.log("คิดเป็นวัน:", durationSeconds / 86400);
+
     return transaction((c) =>
       c.createCampaign(
         form.title,
         form.description,
         goal,
-        Math.round(Number(form.days) * 86400),
+        durationSeconds,
         form.milestones.map((m) => m.title),
         amounts,
       ),
     );
   };
+
   const handleCreate = async (e) => {
     e.preventDefault();
+
     try {
-      if (!account) throw Error("เชื่อมต่อ Wallet ก่อน");
+      if (!account) {
+        throw Error("กรุณาเชื่อมต่อ Wallet ก่อน");
+      }
+
       if (
         !form.title.trim() ||
         !Number(form.goal) ||
-        !Number(form.days) ||
+        !endDateTime ||
         form.milestones.some((m) => !m.title.trim() || !Number(m.amount))
-      )
+      ) {
         throw Error("กรุณากรอกข้อมูลให้ครบ");
-      await create();
-      setForm(initial);
-    } catch (e) {
-      setMessage({ error: true, text: e.message });
+      }
+
+      const selectedDate = new Date(endDateTime);
+      const durationSeconds = Math.floor(
+        (selectedDate.getTime() - Date.now()) / 1000,
+      );
+
+      if (!Number.isFinite(durationSeconds) || durationSeconds < 60) {
+        throw Error("กรุณาเลือกเวลาสิ้นสุดในอนาคตอย่างน้อย 1 นาที");
+      }
+
+      console.log("========== CREATE CAMPAIGN ==========");
+      console.log("วันที่ผู้ใช้เลือก:", endDateTime);
+      console.log("วันที่แปลงแล้ว:", selectedDate.toString());
+      console.log("เวลาปัจจุบัน:", new Date().toString());
+      console.log("ระยะเวลา (วินาที):", durationSeconds);
+      console.log("ระยะเวลา (วัน):", durationSeconds / 86400);
+      console.log("=====================================");
+
+      const success = await create(durationSeconds);
+
+      if (success) {
+        setForm(initial);
+        setEndDateTime("");
+      }
+    } catch (error) {
+      setMessage({
+        error: true,
+        text: error.message,
+      });
     }
   };
+
   const card = (c) => (
     <button className="campaign" key={c.id} onClick={() => openCampaign(c.id)}>
       <div className="cover">
@@ -555,16 +652,13 @@ function App() {
                     />
                   </label>
                   <label>
-                    ระยะเวลาระดมทุน (วัน)
+                    วันและเวลาสิ้นสุดการระดมทุน
                     <input
-                      type="number"
-                      min="1"
-                      max="365"
+                      type="datetime-local"
+                      value={endDateTime}
+                      min={toLocalDateTimeInput(new Date())}
+                      onChange={(e) => setEndDateTime(e.target.value)}
                       required
-                      value={form.days}
-                      onChange={(e) =>
-                        setForm({ ...form, days: e.target.value })
-                      }
                     />
                   </label>
                 </div>
@@ -708,6 +802,31 @@ function App() {
                           selected.raised >= selected.goal &&
                           !m.requested &&
                           (i === 0 || detail.ms[i - 1].paid);
+                      const waitingForFunding =
+                        Date.now() / 1000 < Number(selected.deadline);
+                      const failedFunding =
+                        !waitingForFunding && selected.raised < selected.goal;
+                      const voteClosed =
+                        m.requested &&
+                        !m.paid &&
+                        Date.now() / 1000 >= Number(m.voteDeadline);
+                      const votePassed =
+                        m.approvals > m.votingPowerSnapshot / 2n;
+                      const milestoneStatus = m.paid
+                        ? "จ่ายเงินแล้ว"
+                        : voteClosed
+                          ? votePassed
+                            ? "ผ่านโหวต · รอจ่ายเงิน"
+                            : "ไม่ผ่านการโหวต"
+                          : m.requested
+                            ? "กำลังลงคะแนน"
+                            : failedFunding
+                              ? "ระดมทุนไม่สำเร็จ"
+                              : waitingForFunding
+                                ? "รอสิ้นสุดระดมทุน"
+                                : i > 0 && !detail.ms[i - 1].paid
+                                  ? "รอ Milestone ก่อนหน้า"
+                                  : "พร้อมส่งหลักฐาน";
                       const canVote =
                         BigInt(detail.mine) > 0n &&
                         m.requested &&
@@ -726,13 +845,7 @@ function App() {
                               <span className="number">{i + 1}</span>
                               {m.title}
                             </h3>
-                            <span className="tag">
-                              {m.paid
-                                ? "จ่ายแล้ว"
-                                : m.requested
-                                  ? "รอลงคะแนน"
-                                  : "ยังไม่ส่งงาน"}
-                            </span>
+                            <span className="tag">{milestoneStatus}</span>
                           </div>
                           <p className="muted small">
                             จัดสรร {eth(m.amount)} ETH
@@ -762,6 +875,21 @@ function App() {
                                 ต้องได้เสียงเห็นชอบมากกว่า 50% ของเงินระดมทุน
                               </p>
                             </>
+                          )}
+                          {owner && !canRequest && !m.requested && !m.paid && (
+                            <p className="muted small">
+                              {waitingForFunding
+                                ? `ส่งหลักฐานได้หลังสิ้นสุดระดมทุน ${fmtDate(selected.deadline)} และต้องระดมทุนครบเป้าหมาย`
+                                : failedFunding
+                                  ? "ระดมทุนไม่ถึงเป้าหมาย ไม่สามารถขอเบิกได้"
+                                  : "ต้องรอให้ Milestone ก่อนหน้าได้รับการจ่ายเงินก่อน"}
+                            </p>
+                          )}
+                          {voteClosed && !votePassed && (
+                            <p className="muted small">
+                              คะแนนเห็นชอบไม่ถึงเกณฑ์ ปัจจุบัน Smart Contract
+                              ยังไม่รองรับการส่งหลักฐานใหม่
+                            </p>
                           )}
                           {canRequest && (
                             <div className="action-row">
@@ -838,34 +966,97 @@ function App() {
                       <History size={19} /> ประวัติธุรกรรมล่าสุด
                     </h2>
                     <p className="muted small">
-                      อ่าน Event จากเครือข่ายย้อนหลังประมาณ 45,000 บล็อก
-                      (ไม่ใช่ประวัติทั้งหมด)
+                      {eventsRange || "กำลังตรวจสอบช่วงบล็อก"}
                     </p>
-                    {events.map((e, i) => (
-                      <div className="event" key={i}>
-                        <span>
-                          {
-                            {
-                              Contributed: "สนับสนุนเงิน",
-                              ReleaseRequested: "ขอเบิกเงิน",
-                              Voted: "ลงคะแนน",
-                              FundsReleased: "จ่ายเงิน",
-                              Refunded: "คืนเงิน",
-                            }[e.event.name]
-                          }
-                        </span>
-                        <a
-                          target="_blank"
-                          rel="noreferrer"
-                          href={`https://sepolia.etherscan.io/tx/${e.hash}`}
-                        >
-                          {short(e.hash)} <ExternalLink size={13} />
-                        </a>
-                      </div>
-                    ))}
-                    {!events.length && (
+                    {eventsLoading && (
                       <p className="muted small">
-                        ไม่พบธุรกรรมในช่วงบล็อกที่ตรวจสอบ
+                        กำลังโหลด Event จาก Blockchain...
+                      </p>
+                    )}
+                    {eventsError && (
+                      <p className="small" role="alert">
+                        โหลดประวัติไม่สำเร็จ: {eventsError}
+                      </p>
+                    )}
+                    {!eventsLoading &&
+                      !eventsError &&
+                      events.map((e, i) => {
+                        const args = e.event.args;
+                        const name = e.event.name;
+                        const amount =
+                          name === "Contributed" || name === "Refunded"
+                            ? args.amount
+                            : name === "FundsReleased"
+                              ? args.amount
+                              : null;
+                        const actor =
+                          name === "Contributed"
+                            ? args.contributor
+                            : name === "Refunded"
+                              ? args.backer
+                              : name === "Voted"
+                                ? args.voter
+                                : null;
+                        return (
+                          <div
+                            className="event"
+                            key={`${e.hash}-${e.logIndex}`}
+                          >
+                            <div>
+                              <strong>
+                                {
+                                  {
+                                    Contributed: "เงินเข้า · สนับสนุน",
+                                    ReleaseRequested: "ส่งหลักฐานขอเบิก",
+                                    Voted: "ลงคะแนน",
+                                    FundsReleased: "เงินออก · จ่าย Milestone",
+                                    Refunded: "เงินออก · คืนเงิน",
+                                  }[name]
+                                }
+                              </strong>
+                              {amount !== null && (
+                                <p className="muted small">
+                                  {name === "Contributed" ? "+" : "−"}
+                                  {ethers.formatEther(amount)} ETH
+                                </p>
+                              )}
+                              {actor && (
+                                <p className="muted small">
+                                  Wallet: {short(actor)}
+                                </p>
+                              )}
+                              {name === "Voted" && (
+                                <p className="muted small">
+                                  {args.approve ? "เห็นชอบ" : "ไม่เห็นชอบ"} ·
+                                  น้ำหนัก {ethers.formatEther(args.weight)} ETH
+                                </p>
+                              )}
+                              {(name === "ReleaseRequested" ||
+                                name === "FundsReleased" ||
+                                name === "Voted") && (
+                                <p className="muted small">
+                                  Milestone #{Number(args.milestone) + 1}
+                                </p>
+                              )}
+                              {e.timestamp != null && (
+                                <p className="muted small">
+                                  {fmtDate(e.timestamp)}
+                                </p>
+                              )}
+                            </div>
+                            <a
+                              target="_blank"
+                              rel="noreferrer"
+                              href={`https://sepolia.etherscan.io/tx/${e.hash}`}
+                            >
+                              {short(e.hash)} <ExternalLink size={13} />
+                            </a>
+                          </div>
+                        );
+                      })}
+                    {!eventsLoading && !eventsError && !events.length && (
+                      <p className="muted small">
+                        ไม่พบ Event ของโครงการนี้ในช่วงบล็อกที่ตรวจสอบ
                       </p>
                     )}
                   </div>
