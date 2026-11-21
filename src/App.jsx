@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ethers } from "ethers";
 import {
   Wallet,
@@ -45,6 +45,21 @@ function toLocalDateTimeInput(date) {
 
   return local.toISOString().slice(0, 16);
 }
+// จำกัดความถี่ของ RPC เพื่อไม่ให้ส่งคำขอพร้อมกันจำนวนมาก
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const RPC_DELAY_MS = 180;
+const HISTORY_CHUNK = 2000;
+const HISTORY_LIMIT = 25;
+const HISTORY_LOOKBACK = 45000;
+const RATE_LIMIT_MESSAGE = "Infura จำกัดจำนวนคำขอชั่วคราว กรุณารอสักครู่แล้วลองใหม่";
+function rpcMessage(error) {
+  const message = String(error?.shortMessage || error?.message || error || "");
+  const details = [message, error?.info?.error?.message, error?.code, error?.info?.payload?.method].join(" ");
+  return /Too Many Requests|rate.limit|\b429\b|32005/i.test(details)
+    ? RATE_LIMIT_MESSAGE
+    : message;
+}
+
 function App() {
   const [account, setAccount] = useState("");
   const [admin, setAdmin] = useState("");
@@ -64,6 +79,11 @@ function App() {
   const [eventsRange, setEventsRange] = useState("");
   const [mobile, setMobile] = useState(false);
   const [endDateTime, setEndDateTime] = useState("");
+  const loadSeq = useRef(0);
+  const detailSeq = useRef(0);
+  const historySeq = useRef(0);
+  const historyCache = useRef(new Map());
+  const [historyRequested, setHistoryRequested] = useState(false);
   const isAdmin = same(account, admin);
   const owned = useMemo(
     () => campaigns.filter((c) => same(c.creator, account)),
@@ -98,67 +118,75 @@ function App() {
   ];
   const load = useCallback(async () => {
     if (!ADDRESS || !readProvider) return;
+    const seq = ++loadSeq.current;
     setLoading(true);
     try {
       const c = readContract();
-      const [count, owner] = await Promise.all([c.campaignCount(), c.admin()]);
-      setAdmin(owner);
+      const count = await c.campaignCount();
+      await pause(RPC_DELAY_MS);
+      const owner = await c.admin();
       const ids = Array.from(
         { length: Math.min(Number(count), 200) },
         (_, i) => i + 1,
       );
-      const data = await Promise.all(
-        ids.map(async (id) => {
-          const x = await c.campaigns(id);
-          const mine = account ? await c.contributions(id, account) : 0n;
-          return {
-            id,
-            creator: x.creator,
-            title: x.title,
-            description: x.description,
-            goal: x.goal,
-            deadline: x.deadline,
-            raised: x.raised,
-            released: x.released,
-            refunded: x.refunded,
-            milestoneCount: Number(x.milestoneCount),
-            mine,
-          };
-        }),
-      );
+      const data = [];
+      for (const id of ids) {
+        if (seq !== loadSeq.current) return;
+        await pause(RPC_DELAY_MS);
+        const x = await c.campaigns(id);
+        let mine = 0n;
+        if (account) {
+          await pause(RPC_DELAY_MS);
+          mine = await c.contributions(id, account);
+        }
+        data.push({
+          id, creator: x.creator, title: x.title,
+          description: x.description, goal: x.goal,
+          deadline: x.deadline, raised: x.raised,
+          released: x.released, refunded: x.refunded,
+          milestoneCount: Number(x.milestoneCount), mine,
+        });
+      }
+      if (seq !== loadSeq.current) return;
+      setAdmin(owner);
       setCampaigns(data.reverse());
     } catch (e) {
-      setMessage({ error: true, text: e.shortMessage || e.message });
+      if (seq === loadSeq.current)
+        setMessage({ error: true, text: rpcMessage(e) });
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   }, [account]);
   useEffect(() => {
     load();
+    return () => { loadSeq.current += 1; };
   }, [load]);
   useEffect(() => {
     if (!window.ethereum) return;
     const changed = (a) => {
-      setAccount(a[0] || "");
+      const next = a[0] || "";
+      setAccount((previous) => previous === next ? previous : next);
       setSelected(null);
       setDetail(null);
+      detailSeq.current += 1;
+      historySeq.current += 1;
     };
     const chain = () => {
       setSelected(null);
       setDetail(null);
-      load();
+      detailSeq.current += 1;
+      historySeq.current += 1;
+      // readProvider เป็น RPC ของ Sepolia; ไม่ต้องโหลดซ้ำที่นี่
     };
     window.ethereum.on("accountsChanged", changed);
     window.ethereum.on("chainChanged", chain);
-    window.ethereum
-      .request({ method: "eth_accounts" })
-      .then(changed)
-      .catch(() => {});
+    window.ethereum.request({ method: "eth_accounts" })
+      .then(changed).catch(() => {});
     return () => {
       window.ethereum.removeListener("accountsChanged", changed);
       window.ethereum.removeListener("chainChanged", chain);
     };
-  }, [load]);
+  }, []);
   const connect = async () => {
     try {
       if (!window.ethereum) throw Error("กรุณาติดตั้ง MetaMask");
@@ -180,6 +208,7 @@ function App() {
       const receipt = await tx.wait();
       if (receipt?.status !== 1) throw Error("ธุรกรรมไม่สำเร็จ");
       setMessage({ text: "ธุรกรรมสำเร็จบน Blockchain" });
+      historyCache.current.clear();
       await load();
       if (selected) await openCampaign(selected.id);
       return true;
@@ -194,114 +223,111 @@ function App() {
     }
   };
   const openCampaign = async (id) => {
+    const seq = ++detailSeq.current;
+    historySeq.current += 1;
+    setHistoryRequested(false);
+    setEvents([]);
+    setEventsError("");
+    setEventsRange("");
+    setEventsLoading(false);
     try {
       const c = readContract();
       const x = await c.campaigns(id);
-      const ms = await Promise.all(
-        Array.from({ length: Number(x.milestoneCount) }, (_, i) =>
-          c.getMilestone(id, i),
-        ),
-      );
-      const votes = account
-        ? await Promise.all(ms.map((_, i) => c.hasVoted(id, i, account)))
-        : [];
+      const ms = [];
+      for (let i = 0; i < Number(x.milestoneCount); i++) {
+        if (seq !== detailSeq.current) return;
+        await pause(RPC_DELAY_MS);
+        ms.push(await c.getMilestone(id, i));
+      }
+      const votes = [];
+      if (account) {
+        for (let i = 0; i < ms.length; i++) {
+          if (seq !== detailSeq.current) return;
+          await pause(RPC_DELAY_MS);
+          votes.push(await c.hasVoted(id, i, account));
+        }
+      }
+      if (account) await pause(RPC_DELAY_MS);
       const mine = account ? await c.contributions(id, account) : 0n;
+      if (seq !== detailSeq.current) return;
       setDetail({ ms, votes, mine });
       setSelected({
-        id,
-        creator: x.creator,
-        title: x.title,
-        description: x.description,
-        goal: x.goal,
-        deadline: x.deadline,
-        raised: x.raised,
-        released: x.released,
-        refunded: x.refunded,
+        id, creator: x.creator, title: x.title,
+        description: x.description, goal: x.goal,
+        deadline: x.deadline, raised: x.raised,
+        released: x.released, refunded: x.refunded,
         milestoneCount: Number(x.milestoneCount),
       });
       setTab("detail");
-      setEvents([]);
-      setEventsError("");
-      setEventsLoading(true);
-      try {
-        const latestBlock = await readProvider.getBlockNumber();
-        // Set VITE_CONTRACT_DEPLOY_BLOCK to the block where this contract was deployed
-        // to retrieve its entire event history. Without it, scan the latest 45,000 blocks.
-        const configuredStart = import.meta.env.VITE_CONTRACT_DEPLOY_BLOCK;
-        const startBlock =
-          configuredStart && /^\d+$/.test(configuredStart)
-            ? Number(configuredStart)
-            : Math.max(0, latestBlock - 45000);
-        if (startBlock > latestBlock)
-          throw Error("Deployment block is in the future");
-        setEventsRange(
-          configuredStart
-            ? `ตั้งแต่บล็อกที่ Deploy (${startBlock.toLocaleString()}) ถึง ${latestBlock.toLocaleString()}`
-            : `ย้อนหลัง 45,000 บล็อกล่าสุด (${startBlock.toLocaleString()}–${latestBlock.toLocaleString()}) — กำหนด VITE_CONTRACT_DEPLOY_BLOCK เพื่อดูประวัติทั้งหมด`,
-        );
-        const iface = new ethers.Interface(ABI);
-        const names = [
-          "Contributed",
-          "ReleaseRequested",
-          "Voted",
-          "FundsReleased",
-          "Refunded",
-        ];
-        const topics = names.map((name) => iface.getEvent(name).topicHash);
-        const campaignTopic = ethers.zeroPadValue(ethers.toBeHex(id), 32);
-        const found = [];
-        // Query in small chunks to avoid eth_getLogs range limits.
-        for (
-          let fromBlock = startBlock;
-          fromBlock <= latestBlock;
-          fromBlock += 2000
-        ) {
-          const toBlock = Math.min(latestBlock, fromBlock + 1999);
-          const logs = await readProvider.getLogs({
-            address: ADDRESS,
-            topics: [topics, campaignTopic],
-            fromBlock,
-            toBlock,
-          });
-          for (const log of logs) {
-            const event = iface.parseLog(log);
-            if (event)
-              found.push({
-                event,
-                hash: log.transactionHash,
-                blockNumber: log.blockNumber,
-                logIndex: log.index,
-              });
-          }
-        }
-        found.sort(
-          (a, b) => b.blockNumber - a.blockNumber || b.logIndex - a.logIndex,
-        );
-        const latest = found.slice(0, 25);
-        const blocks = [...new Set(latest.map((e) => e.blockNumber))];
-        const timestamps = new Map(
-          await Promise.all(
-            blocks.map(async (number) => {
-              const block = await readProvider.getBlock(number);
-              return [number, block?.timestamp ?? null];
-            }),
-          ),
-        );
-        setEvents(
-          latest.map((e) => ({
-            ...e,
-            timestamp: timestamps.get(e.blockNumber),
-          })),
-        );
-      } catch (err) {
-        setEventsError(
-          err.shortMessage || err.message || "ไม่สามารถอ่าน Event ได้",
-        );
-      } finally {
-        setEventsLoading(false);
-      }
     } catch (e) {
-      setMessage({ error: true, text: e.message });
+      if (seq === detailSeq.current)
+        setMessage({ error: true, text: rpcMessage(e) });
+    }
+  };
+
+  // โหลดประวัติเมื่อผู้ใช้กดปุ่มเท่านั้น และอ่านจากบล็อกใหม่ไปเก่า
+  const loadHistory = async (id, force = false) => {
+    const seq = ++historySeq.current;
+    setHistoryRequested(true);
+    setEventsError("");
+    const cacheKey = `${ADDRESS.toLowerCase()}:${id}`;
+    const cached = historyCache.current.get(cacheKey);
+    if (!force && cached && Date.now() - cached.savedAt < 60000) {
+      setEvents(cached.events);
+      setEventsRange(cached.range);
+      setEventsLoading(false);
+      return;
+    }
+    setEventsLoading(true);
+    try {
+      const latestBlock = await readProvider.getBlockNumber();
+      const configuredStart = import.meta.env.VITE_CONTRACT_DEPLOY_BLOCK;
+      const startBlock = configuredStart && /^\d+$/.test(configuredStart)
+        ? Number(configuredStart)
+        : Math.max(0, latestBlock - HISTORY_LOOKBACK);
+      if (startBlock > latestBlock) throw Error("Deployment block is in the future");
+      const iface = new ethers.Interface(ABI);
+      const names = ["Contributed", "ReleaseRequested", "Voted", "FundsReleased", "Refunded"];
+      const topics = names.map((name) => iface.getEvent(name).topicHash);
+      const campaignTopic = ethers.zeroPadValue(ethers.toBeHex(id), 32);
+      const found = [];
+      let scannedTo = latestBlock;
+      for (let toBlock = latestBlock; toBlock >= startBlock; toBlock -= HISTORY_CHUNK) {
+        if (seq !== historySeq.current) return;
+        const fromBlock = Math.max(startBlock, toBlock - HISTORY_CHUNK + 1);
+        await pause(RPC_DELAY_MS);
+        const logs = await readProvider.getLogs({
+          address: ADDRESS, topics: [topics, campaignTopic], fromBlock, toBlock,
+        });
+        scannedTo = fromBlock;
+        for (const log of logs) {
+          const event = iface.parseLog(log);
+          if (event) found.push({
+            event, hash: log.transactionHash,
+            blockNumber: log.blockNumber, logIndex: log.index,
+          });
+        }
+        if (found.length >= HISTORY_LIMIT) break;
+      }
+      found.sort((a, b) => b.blockNumber - a.blockNumber || b.logIndex - a.logIndex);
+      const latest = found.slice(0, HISTORY_LIMIT);
+      const timestamps = new Map();
+      for (const number of [...new Set(latest.map((e) => e.blockNumber))]) {
+        if (seq !== historySeq.current) return;
+        await pause(RPC_DELAY_MS);
+        const block = await readProvider.getBlock(number);
+        timestamps.set(number, block?.timestamp ?? null);
+      }
+      if (seq !== historySeq.current) return;
+      const result = latest.map((e) => ({ ...e, timestamp: timestamps.get(e.blockNumber) }));
+      const range = `ตรวจสอบบล็อก ${scannedTo.toLocaleString()}–${latestBlock.toLocaleString()}${scannedTo > startBlock ? " (หยุดเมื่อพบ 25 รายการล่าสุด)" : ""}`;
+      historyCache.current.set(cacheKey, { events: result, range, savedAt: Date.now() });
+      setEvents(result);
+      setEventsRange(range);
+    } catch (err) {
+      if (seq === historySeq.current) setEventsError(rpcMessage(err));
+    } finally {
+      if (seq === historySeq.current) setEventsLoading(false);
     }
   };
 
@@ -837,7 +863,7 @@ function App() {
                         m.requested &&
                         !m.paid &&
                         Date.now() / 1000 >= Number(m.voteDeadline) &&
-                        m.approvals > m.votingPowerSnapshot / 2;
+                        m.approvals > m.votingPowerSnapshot / 2n;
                       return (
                         <div className="milestone" key={i}>
                           <div className="between">
@@ -965,9 +991,18 @@ function App() {
                     <h2>
                       <History size={19} /> ประวัติธุรกรรมล่าสุด
                     </h2>
-                    <p className="muted small">
-                      {eventsRange || "กำลังตรวจสอบช่วงบล็อก"}
-                    </p>
+                    <div className="between">
+                      <p className="muted small">
+                        {eventsRange || "กดโหลดประวัติเมื่อต้องการ เพื่อลดการใช้ Infura"}
+                      </p>
+                      <button
+                        className="outline"
+                        disabled={eventsLoading}
+                        onClick={() => loadHistory(selected.id, true)}
+                      >
+                        <RefreshCw size={15} /> {eventsLoading ? "กำลังโหลด..." : "โหลดประวัติ"}
+                      </button>
+                    </div>
                     {eventsLoading && (
                       <p className="muted small">
                         กำลังโหลด Event จาก Blockchain...
@@ -1054,7 +1089,7 @@ function App() {
                           </div>
                         );
                       })}
-                    {!eventsLoading && !eventsError && !events.length && (
+                    {historyRequested && !eventsLoading && !eventsError && !events.length && (
                       <p className="muted small">
                         ไม่พบ Event ของโครงการนี้ในช่วงบล็อกที่ตรวจสอบ
                       </p>

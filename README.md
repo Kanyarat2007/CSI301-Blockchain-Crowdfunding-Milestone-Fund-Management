@@ -33,21 +33,21 @@ npm run dev
 ## 3. ขั้นตอนทดสอบครบวงจร
 
 1. Wallet A เชื่อมต่อและสร้างโครงการ เป้าหมาย `0.001 ETH` ระยะเวลา 1 วัน Milestone 1=`0.001 ETH`
-![1](/images/1.png)
+   ![1](/images/1.png)
 
 2. Wallet B ส่ง `0.02 ETH` เข้า Campaign
-![2](/images/2.png)
+   ![2](/images/2.png)
 
 3. รอ deadline
 
 4. Wallet A ส่งหลักฐาน Milestone 1 เช่น URL GitHub/Google Drive ที่เปิดอ่านได้
-![4](/images/4.png)
+   ![4](/images/4.png)
 
 5. Wallet B โหวตเห็นชอบ
-![5](/images/5.png)
+   ![5](/images/5.png)
 
 6. หลัง 3 วัน เรียก `release()` (ใครก็เรียกได้) และตรวจเงินเข้ากระเป๋า Creator
-![6]
+   ![6](/images/6.png)
 
 7. ทดสอบ Refund ด้วยอีก Campaign ที่ยอดไม่ถึงเป้าหมายเมื่อหมดเวลา
-![7]
+   ![7](/images/7.png)
